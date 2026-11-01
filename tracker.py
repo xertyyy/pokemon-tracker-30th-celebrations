@@ -75,48 +75,48 @@ HEADERS = {
 }
 
 
-def finde_offers(obj):
-    """Sucht rekursiv nach dem ersten 'offers'-Eintrag in den schema.org-Daten."""
+def finde_produkte(obj):
+    """Sammelt rekursiv alle schema.org-Objekte vom Typ 'Product'."""
+    gefunden = []
     if isinstance(obj, dict):
-        if "offers" in obj:
-            o = obj["offers"]
-            if isinstance(o, list):
-                o = o[0] if o else None
-            if isinstance(o, dict):
-                return o
+        typ = obj.get("@type", "")
+        typen = typ if isinstance(typ, list) else [typ]
+        if any("Product" in str(t) for t in typen):
+            gefunden.append(obj)
         for v in obj.values():
-            treffer = finde_offers(v)
-            if treffer:
-                return treffer
+            gefunden += finde_produkte(v)
     elif isinstance(obj, list):
         for v in obj:
-            treffer = finde_offers(v)
-            if treffer:
-                return treffer
-    return None
+            gefunden += finde_produkte(v)
+    return gefunden
 
 
 def lies_status(html):
-    """Liest Verfügbarkeit und Preis aus den strukturierten Produktdaten (schema.org)."""
+    """
+    Liest Verfügbarkeit und Preis NUR aus den offiziellen Produktdaten (schema.org, Typ Product).
+    Rückgabe: (verfuegbar, preis, quelle)
+    Ein "In den Warenkorb"-Text auf der Seite reicht NICHT, weil er oft zu anderen
+    empfohlenen Produkten gehört (Fehlalarm-Gefahr).
+    """
     for block in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S | re.I):
         try:
             daten = json.loads(block.strip())
         except json.JSONDecodeError:
             continue
-        offers = finde_offers(daten)
-        if offers:
-            verfuegbar = "instock" in str(offers.get("availability", "")).lower()
+        for produkt in finde_produkte(daten):
+            offers = produkt.get("offers")
+            if isinstance(offers, list):
+                offers = offers[0] if offers else None
+            if not isinstance(offers, dict):
+                continue
+            avail = str(offers.get("availability", "")).lower()
+            verfuegbar = avail.endswith("instock")   # "outofstock", "preorder" usw. zählen nicht
             try:
                 preis = float(str(offers.get("price") or offers.get("lowPrice")).replace(",", "."))
             except (TypeError, ValueError):
                 preis = None
-            return verfuegbar, preis
-    text = html.lower()
-    if any(w in text for w in ("ausverkauft", "nicht verfügbar", "nicht lagernd", "out of stock", "sold out")):
-        return False, None
-    if "in den warenkorb" in text or "add to basket" in text or "add to cart" in text:
-        return True, None
-    return False, None
+            return verfuegbar, preis, "Produktdaten"
+    return False, None, "keine Produktdaten – wird nie gemeldet"
 
 
 def push(titel, text, url):
@@ -139,8 +139,8 @@ def main():
     for p in PRODUKTE:
         try:
             r = requests.get(p["url"], headers=HEADERS, timeout=20)
-            print(f"  HTTP {r.status_code}, {len(r.text)} Zeichen, JSON-LD: {'application/ld+json' in r.text}")
-            verfuegbar, preis = lies_status(r.text)
+            verfuegbar, preis, quelle = lies_status(r.text)
+            print(f"  HTTP {r.status_code}, {len(r.text)} Zeichen, Quelle: {quelle}")
         except requests.RequestException as fehler:
             print(f"[{zeit}] {p['name']}: Fehler – {fehler}")
             continue
