@@ -1,57 +1,120 @@
 """
 Pokémon-Stock-Tracker für GitHub Actions (läuft in der Cloud, PC muss nicht an sein).
 Prüft bei jedem Lauf alle Produkte einmal, merkt sich den Status in status.json
-und schickt per ntfy eine Push-Nachricht, wenn etwas neu verfügbar wird.
+und schickt per ntfy eine Push-Nachricht, wenn etwas neu verfügbar wird
+UND der Preis pro Booster-Pack unter dem Limit liegt.
 """
 
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]      # kommt aus dem GitHub-Secret
-MAX_PREIS = 35.00                          # nur melden, wenn Preis <= diesem Wert (None = immer)
+NTFY_TOPIC = os.environ["NTFY_TOPIC"]   # kommt aus dem GitHub-Secret
+MAX_PREIS_PRO_PACK = 7.00               # Standard-Limit in € pro Booster-Pack
+PAUSE_SEKUNDEN = 2                      # Pause zwischen Shops (höflich bleiben)
 STATUS_DATEI = Path("status.json")
 
+# packs = Anzahl Booster im Produkt
+# max_pro_pack (optional) = eigenes Limit für dieses Produkt, z. B. wegen Promokarten
+# faktor (optional) = Umrechnung in € (z. B. Pfund), nur ungefähr
 PRODUKTE = [
-    {
-        "name": "Boosterbundle 30 Jahre – Smyths",
-        "url": "https://www.smythstoys.com/de/de-de/spielzeug/action-spielzeug/pokemon/pokemon-figuren-und-sets/pokemon-30-jahre-boosterbundle/p/265602",
-    },
-    {
-        "name": "Boosterbundle 30 Jahre – Card-Corner",
-        "url": "https://www.card-corner.de/Pokemon-30-Jahre-Booster-Bundle",
-    },
+    # ---------- Boosterbundle (6 Packs) ----------
+    {"name": "Bundle – Smyths DE", "packs": 6,
+     "url": "https://www.smythstoys.com/de/de-de/spielzeug/action-spielzeug/pokemon/pokemon-figuren-und-sets/pokemon-30-jahre-boosterbundle/p/265602"},
+    {"name": "Bundle – Card-Corner", "packs": 6,
+     "url": "https://www.card-corner.de/Pokemon-30-Jahre-Booster-Bundle"},
+    {"name": "Bundle – Comic Planet", "packs": 6,
+     "url": "https://www.comicplanet.de/sammelkarten/pokemon/deutsch/displays-pkm/booster-pkm/pokemon-30-jahre-booster-bundle-deutsch"},
+    {"name": "Bundle – VEDES", "packs": 6,
+     "url": "https://www.vedes.com/p/pokemon-sammelkartenspiel-boosterbundle-30-jahre-14524-61219366"},
+    {"name": "Bundle – SpielRaum AT", "packs": 6,
+     "url": "https://www.spielraum.co.at/de/pokemon/product/30-jahre-30c-boosterbundle-de"},
+    {"name": "Bundle EN – Chaos Cards UK (GBP)", "packs": 6, "faktor": 1.15,
+     "url": "https://www.chaoscards.co.uk/prod/booster-packs-pokemon/pokemon-30th-celebration-booster-bundle"},
+
+    # ---------- Top-Trainer-Box (9 Packs) ----------
+    {"name": "Top-Trainer-Box – Smyths DE", "packs": 9,
+     "url": "https://www.smythstoys.com/de/de-de/spielzeug/action-spielzeug/pokemon/pokemon-karten/pokemon-karten-top-trainer-box-30-jahre-edition/p/264148"},
+    {"name": "Top-Trainer-Box – MediaMarkt AT", "packs": 9,
+     "url": "https://www.mediamarkt.at/de/product/_pokemon-company-international-top-trainer-box-30-jahre-sammelkarten-2087300.html"},
+    {"name": "Top-Trainer-Box – Toys for Fun", "packs": 9,
+     "url": "https://www.toys-for-fun.com/de/pokemon-30-jahre-top-trainer-box.html"},
+
+    # ---------- Tin-Box ex (4 Packs + Promo) ----------
+    {"name": "Tin Quajutsu-ex – Smyths AT", "packs": 4,
+     "url": "https://www.smythstoys.com/at/de-at/spielzeug/action-spielzeug/pokemon/pokemon-karten/pokemon-tin-box-mit-quajutsu-ex-30-jahre-edition/p/264164"},
+
+    # ---------- Poster-Kollektion (3 Packs + 3 Promos) ----------
+    {"name": "Poster-Kollektion – Smyths AT", "packs": 3, "max_pro_pack": 8.50,
+     "url": "https://www.smythstoys.com/at/de-at/spielzeug/action-spielzeug/pokemon/pokemon-karten/pokemon-poster-kollektion-30-jahre-edition/p/264190"},
+
+    # ---------- 2er-Blister (2 Packs + Promo + Münze) ----------
+    {"name": "Blister DE – Comic Planet", "packs": 2,
+     "url": "https://www.comicplanet.de/sammelkarten/pokemon/deutsch/specials-pkm/pokemon-30-jahre-2-pack-blister-deutsch"},
+    {"name": "Blister DE – Nanis Kinderparadies", "packs": 2,
+     "url": "https://www.nanis-kinderparadies.de/shop/spielwelten/sammelkarten/19839/pokemon-30-jahre-2-pack-blister"},
+    {"name": "Blister EN – Card-Corner", "packs": 2,
+     "url": "https://www.card-corner.de/Pokemon-30th-Celebration-2-Pack-Blister"},
+
+    # ---------- Mini-Tin (2 Packs) ----------
+    {"name": "Mini-Tin DE – KEEPSEVEN", "packs": 2,
+     "url": "https://keepseven.de/product/pokemon-30-jahre-mini-tin-de-zufaellig/"},
+    {"name": "Mini-Tin DE – Spiele-Riese", "packs": 2,
+     "url": "https://www.spiele-riese.de/shop/spielwelten/sammelkarten/19852/pokemon-30-jahre-mini-tin"},
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (privater Stock-Tracker)"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+}
+
+
+def finde_offers(obj):
+    """Sucht rekursiv nach dem ersten 'offers'-Eintrag in den schema.org-Daten."""
+    if isinstance(obj, dict):
+        if "offers" in obj:
+            o = obj["offers"]
+            if isinstance(o, list):
+                o = o[0] if o else None
+            if isinstance(o, dict):
+                return o
+        for v in obj.values():
+            treffer = finde_offers(v)
+            if treffer:
+                return treffer
+    elif isinstance(obj, list):
+        for v in obj:
+            treffer = finde_offers(v)
+            if treffer:
+                return treffer
+    return None
 
 
 def lies_status(html):
     """Liest Verfügbarkeit und Preis aus den strukturierten Produktdaten (schema.org)."""
-    for block in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S):
+    for block in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html, re.S | re.I):
         try:
-            daten = json.loads(block)
+            daten = json.loads(block.strip())
         except json.JSONDecodeError:
             continue
-        for e in (daten if isinstance(daten, list) else [daten]):
-            offers = e.get("offers") if isinstance(e, dict) else None
-            if isinstance(offers, list):
-                offers = offers[0] if offers else None
-            if isinstance(offers, dict):
-                verfuegbar = "InStock" in str(offers.get("availability", ""))
-                try:
-                    preis = float(offers.get("price") or offers.get("lowPrice"))
-                except (TypeError, ValueError):
-                    preis = None
-                return verfuegbar, preis
+        offers = finde_offers(daten)
+        if offers:
+            verfuegbar = "instock" in str(offers.get("availability", "")).lower()
+            try:
+                preis = float(str(offers.get("price") or offers.get("lowPrice")).replace(",", "."))
+            except (TypeError, ValueError):
+                preis = None
+            return verfuegbar, preis
     text = html.lower()
-    if "ausverkauft" in text or "nicht verfügbar" in text or "out of stock" in text:
+    if any(w in text for w in ("ausverkauft", "nicht verfügbar", "nicht lagernd", "out of stock", "sold out")):
         return False, None
-    if "in den warenkorb" in text:
+    if "in den warenkorb" in text or "add to basket" in text or "add to cart" in text:
         return True, None
     return False, None
 
@@ -63,6 +126,10 @@ def push(titel, text, url):
         headers={"Title": titel.encode("utf-8"), "Click": url, "Priority": "high", "Tags": "zap"},
         timeout=10,
     )
+
+
+def euro(betrag):
+    return f"{betrag:.2f} €".replace(".", ",")
 
 
 def main():
@@ -78,13 +145,23 @@ def main():
             print(f"[{zeit}] {p['name']}: Fehler – {fehler}")
             continue
 
-        preis_txt = f"{preis:.2f} €".replace(".", ",") if preis else "Preis unbekannt"
+        if preis is not None:
+            preis = preis * p.get("faktor", 1.0)
+            pro_pack = preis / p["packs"]
+            preis_txt = f"{euro(preis)} = {euro(pro_pack)}/Pack"
+        else:
+            pro_pack = None
+            preis_txt = "Preis unbekannt"
+
         print(f"[{zeit}] {p['name']}: {'VERFÜGBAR' if verfuegbar else 'nicht verfügbar'} ({preis_txt})")
 
-        preis_ok = MAX_PREIS is None or preis is None or preis <= MAX_PREIS
+        limit = p.get("max_pro_pack", MAX_PREIS_PRO_PACK)
+        preis_ok = pro_pack is None or pro_pack <= limit
         if verfuegbar and preis_ok and not status.get(p["url"], False):
             push(f"Auf Lager: {p['name']}", f"{preis_txt} – jetzt kaufen!", p["url"])
         status[p["url"]] = bool(verfuegbar)
+
+        time.sleep(PAUSE_SEKUNDEN)
 
     STATUS_DATEI.write_text(json.dumps(status, indent=2, ensure_ascii=False))
 
