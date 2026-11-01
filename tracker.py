@@ -72,6 +72,7 @@ def main():
     for p in PRODUKTE:
         try:
             r = requests.get(p["url"], headers=HEADERS, timeout=20)
+                        print(f"  HTTP {r.status_code}, {len(r.text)} Zeichen, JSON-LD: {'application/ld+json' in r.text}")
             verfuegbar, preis = lies_status(r.text)
         except requests.RequestException as fehler:
             print(f"[{zeit}] {p['name']}: Fehler – {fehler}")
