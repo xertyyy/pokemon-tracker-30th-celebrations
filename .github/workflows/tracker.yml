@@ -1,1 +1,34 @@
+name: Pokemon Stock Tracker
 
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # alle 10 Minuten (GitHub kann sich etwas verspäten)
+  workflow_dispatch:          # manueller Start über den "Run workflow"-Button
+
+permissions:
+  contents: write             # nötig, um status.json zu speichern
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Shops prüfen
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python tracker.py
+
+      - name: Status speichern
+        run: |
+          git config user.name "tracker-bot"
+          git config user.email "tracker-bot@users.noreply.github.com"
+          git add status.json
+          git diff --cached --quiet || git commit -m "Status-Update"
+          git push
